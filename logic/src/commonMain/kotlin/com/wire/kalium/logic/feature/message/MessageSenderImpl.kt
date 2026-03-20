@@ -66,6 +66,7 @@ import com.wire.kalium.util.DateTimeUtil
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.withContext
 import kotlinx.datetime.Instant
+import kotlin.time.TimeSource
 
 // TODO(modularisation): Move to :messaging:sending.
 //                       It ain't gonna be easy :)
@@ -122,8 +123,18 @@ internal class MessageSenderImpl internal constructor(
     }
 
     override suspend fun sendMessage(message: Message.Sendable, messageTarget: MessageTarget): Either<CoreFailure, Unit> =
-        messageSendingInterceptor
+        run {
+            val sendTimer = TimeSource.Monotonic.markNow()
+            logger.i(
+                "[tmp-send-trace] step=message_sender_send_message_start conversationId=${message.conversationId.toLogString()} messageId=${message.id} senderUserId=${message.senderUserId.toLogString()}"
+            )
+            messageSendingInterceptor
             .prepareMessage(message)
+            .onSuccess {
+                logger.i(
+                    "[tmp-send-trace] step=message_sender_prepare_message_end conversationId=${it.conversationId.toLogString()} messageId=${it.id} elapsedMs=${sendTimer.elapsedNow().inWholeMilliseconds}"
+                )
+            }
             .flatMap { processedMessage ->
                 transactionProvider.transaction("sendMessage") { transactionContext ->
                     attemptToSend(transactionContext, processedMessage, messageTarget).map { serverDate ->
@@ -164,8 +175,16 @@ internal class MessageSenderImpl internal constructor(
                     startSelfDeletionIfNeeded(message)
                 }
             }.onFailure {
+                logger.e(
+                    "[tmp-send-trace] step=message_sender_send_message_failure conversationId=${message.conversationId.toLogString()} messageId=${message.id} failureType=${it::class.simpleName ?: "UnknownFailure"} elapsedMs=${sendTimer.elapsedNow().inWholeMilliseconds}"
+                )
                 logger.e("Failed to send message ${message::class.qualifiedName}. Failure = $it")
+            }.onSuccess {
+                logger.i(
+                    "[tmp-send-trace] step=message_sender_send_message_end conversationId=${message.conversationId.toLogString()} messageId=${message.id} state=success elapsedMs=${sendTimer.elapsedNow().inWholeMilliseconds}"
+                )
             }
+        }
 
     override suspend fun broadcastMessage(
         message: BroadcastMessage,
@@ -182,9 +201,16 @@ internal class MessageSenderImpl internal constructor(
         message: Message.Sendable,
         messageTarget: MessageTarget = MessageTarget.Conversation()
     ): Either<CoreFailure, Instant> {
+        val protocolTimer = TimeSource.Monotonic.markNow()
+        logger.i(
+            "[tmp-send-trace] step=attempt_to_send_protocol_info_start conversationId=${message.conversationId.toLogString()} messageId=${message.id}"
+        )
         return conversationRepository
             .getConversationProtocolInfo(message.conversationId)
             .flatMap { protocolInfo ->
+                logger.i(
+                    "[tmp-send-trace] step=attempt_to_send_protocol_info_end conversationId=${message.conversationId.toLogString()} messageId=${message.id} protocol=${protocolInfo::class.simpleName ?: "UnknownProtocol"} elapsedMs=${protocolTimer.elapsedNow().inWholeMilliseconds}"
+                )
                 when (protocolInfo) {
                     is Conversation.ProtocolInfo.MLS -> {
                         attemptToSendWithMLS(transactionContext, protocolInfo, message)
@@ -294,11 +320,24 @@ internal class MessageSenderImpl internal constructor(
         protocolInfo: Conversation.ProtocolInfo.MLS,
         message: Message.Sendable
     ): Either<CoreFailure, Instant> =
-        mlsMessageCreator.prepareMLSGroupAndCreateOutgoingMLSMessage(transactionContext, protocolInfo.groupId, message)
+        run {
+            val mlsTimer = TimeSource.Monotonic.markNow()
+            logger.i(
+                "[tmp-send-trace] step=attempt_to_send_mls_start conversationId=${message.conversationId.toLogString()} messageId=${message.id} groupId=${protocolInfo.groupId.toLogString()}"
+            )
+            mlsMessageCreator.prepareMLSGroupAndCreateOutgoingMLSMessage(transactionContext, protocolInfo.groupId, message)
+            .onSuccess {
+                logger.i(
+                    "[tmp-send-trace] step=attempt_to_send_mls_message_prepared conversationId=${message.conversationId.toLogString()} messageId=${message.id} elapsedMs=${mlsTimer.elapsedNow().inWholeMilliseconds}"
+                )
+            }
             .flatMap { mlsMessage ->
                 messageRepository.sendMLSMessage(mlsMessage).fold({
                     when (val mlsRejectionCause = (it.wrapNetworkMlsFailureIfApplicable() as? MLSFailure.MessageRejected)?.cause) {
                         is NetworkFailure.MlsMessageRejectedFailure.GroupOutOfSync -> {
+                            logger.w(
+                                "[tmp-send-trace] step=attempt_to_send_mls_retry conversationId=${message.conversationId.toLogString()} messageId=${message.id} retryState=group_out_of_sync"
+                            )
                             mlsMissingUsersMessageRejectionHandler.handle(
                                 transactionContext,
                                 message.conversationId,
@@ -307,6 +346,9 @@ internal class MessageSenderImpl internal constructor(
                             ).flatMap { attemptToSend(transactionContext, message) }
                         }
                         is NetworkFailure.MlsMessageRejectedFailure.StaleMessage -> {
+                            logger.w(
+                                "[tmp-send-trace] step=attempt_to_send_mls_retry conversationId=${message.conversationId.toLogString()} messageId=${message.id} retryState=stale_message"
+                            )
                             logger.logStructuredJson(
                                 level = KaliumLogLevel.WARN,
                                 leadingMessage = "Message Send Stale",
@@ -325,12 +367,18 @@ internal class MessageSenderImpl internal constructor(
                         else -> Either.Left(it)
                     }
                 }, { messageSent ->
+                    logger.i(
+                        "[tmp-send-trace] step=attempt_to_send_mls_repository_end conversationId=${message.conversationId.toLogString()} messageId=${message.id} state=success elapsedMs=${mlsTimer.elapsedNow().inWholeMilliseconds}"
+                    )
                     handleMlsRecipientsDeliveryFailure(message, messageSent).flatMap {
                         Either.Right(messageSent.time)
                     }
                 })
             }
             .onFailure {
+                logger.e(
+                    "[tmp-send-trace] step=attempt_to_send_mls_end conversationId=${message.conversationId.toLogString()} messageId=${message.id} state=failure failureType=${it::class.simpleName ?: "UnknownFailure"} elapsedMs=${mlsTimer.elapsedNow().inWholeMilliseconds}"
+                )
                 logger.logStructuredJson(
                     level = KaliumLogLevel.ERROR,
                     leadingMessage = "Message Send Failure",
@@ -342,6 +390,9 @@ internal class MessageSenderImpl internal constructor(
                     )
                 )
             }.onSuccess {
+                logger.i(
+                    "[tmp-send-trace] step=attempt_to_send_mls_end conversationId=${message.conversationId.toLogString()} messageId=${message.id} state=success elapsedMs=${mlsTimer.elapsedNow().inWholeMilliseconds}"
+                )
                 logger.logStructuredJson(
                     level = KaliumLogLevel.INFO,
                     leadingMessage = "Message Send Success",
@@ -352,6 +403,7 @@ internal class MessageSenderImpl internal constructor(
                     )
                 )
             }
+        }
 
     /**
      * Attempts to send a Proteus envelope
@@ -470,6 +522,9 @@ internal class MessageSenderImpl internal constructor(
                             }
 
                             remainingAttempts > 0 -> {
+                                logger.w(
+                                    "[tmp-send-trace] step=proteus_retry conversationId=${conversationId?.toLogString() ?: "n/a"} messageId=$messageId retryState=clients_changed remainingAttempts=$remainingAttempts"
+                                )
                                 logger.w(
                                     "Retrying (remaining attempts: $remainingAttempts) after Proteus $action " +
                                             "Failure: { \"message\" : \"${messageLogString}\", \"errorInfo\" : \"${failure}\" }"

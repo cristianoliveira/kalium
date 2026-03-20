@@ -47,6 +47,7 @@ import kotlinx.coroutines.async
 import kotlinx.coroutines.flow.first
 import kotlinx.datetime.Clock
 import kotlin.time.Duration
+import kotlin.time.TimeSource
 import kotlin.uuid.Uuid
 
 /**
@@ -76,11 +77,22 @@ public class SendTextMessageUseCase internal constructor(
         mentions: List<MessageMention> = emptyList(),
         quotedMessageId: String? = null
     ): MessageOperationResult = scope.async(dispatchers.io) {
+        val sendTimer = TimeSource.Monotonic.markNow()
+        kaliumLogger.i(
+            "[tmp-send-trace] step=send_text_use_case_start conversationId=${conversationId.toLogString()} selfUserId=${selfUserId.toLogString()}"
+        )
+        val slowSyncTimer = TimeSource.Monotonic.markNow()
         slowSyncRepository.slowSyncStatus.first {
             it is SlowSyncStatus.Complete
         }
+        kaliumLogger.i(
+            "[tmp-send-trace] step=slow_sync_complete conversationId=${conversationId.toLogString()} elapsedMs=${slowSyncTimer.elapsedNow().inWholeMilliseconds}"
+        )
 
         val generatedMessageUuid = Uuid.random().toString()
+        kaliumLogger.i(
+            "[tmp-send-trace] step=message_uuid_generated conversationId=${conversationId.toLogString()} messageId=$generatedMessageUuid"
+        )
         val expectsReadConfirmation = userPropertyRepository.getReadReceiptsStatus()
         val messageTimer: Duration? = selfDeleteTimer(conversationId, true)
             .first()
@@ -113,10 +125,32 @@ public class SendTextMessageUseCase internal constructor(
                 expirationData = messageTimer?.let { Message.ExpirationData(it) },
                 isSelfMessage = true
             )
+            val persistTimer = TimeSource.Monotonic.markNow()
+            kaliumLogger.i(
+                "[tmp-send-trace] step=persist_message_start conversationId=${conversationId.toLogString()} messageId=${message.id}"
+            )
             persistMessage(message).flatMap {
-                messageSender.sendMessage(message)
+                kaliumLogger.i(
+                    "[tmp-send-trace] step=persist_message_end conversationId=${conversationId.toLogString()} messageId=${message.id} elapsedMs=${persistTimer.elapsedNow().inWholeMilliseconds}"
+                )
+                val sendTimerInternal = TimeSource.Monotonic.markNow()
+                kaliumLogger.i(
+                    "[tmp-send-trace] step=message_sender_send_start conversationId=${conversationId.toLogString()} messageId=${message.id}"
+                )
+                messageSender.sendMessage(message).also { result ->
+                    val state = when (result) {
+                        is com.wire.kalium.common.functional.Either.Left -> "failure"
+                        is com.wire.kalium.common.functional.Either.Right -> "success"
+                    }
+                    kaliumLogger.i(
+                        "[tmp-send-trace] step=message_sender_send_end conversationId=${conversationId.toLogString()} messageId=${message.id} state=$state elapsedMs=${sendTimerInternal.elapsedNow().inWholeMilliseconds}"
+                    )
+                }
             }
         }.onFailure {
+            kaliumLogger.e(
+                "[tmp-send-trace] step=send_text_use_case_failure conversationId=${conversationId.toLogString()} messageId=$generatedMessageUuid failureType=${it::class.simpleName ?: "UnknownFailure"} elapsedMs=${sendTimer.elapsedNow().inWholeMilliseconds}"
+            )
             messageSendFailureHandler.handleFailureAndUpdateMessageStatus(
                 failure = it,
                 conversationId = conversationId,
@@ -124,8 +158,18 @@ public class SendTextMessageUseCase internal constructor(
                 messageType = TYPE
             )
         }.fold(
-            { MessageOperationResult.Failure(it) },
-            { MessageOperationResult.Success }
+            {
+                kaliumLogger.i(
+                    "[tmp-send-trace] step=send_text_use_case_end conversationId=${conversationId.toLogString()} messageId=$generatedMessageUuid state=failure elapsedMs=${sendTimer.elapsedNow().inWholeMilliseconds}"
+                )
+                MessageOperationResult.Failure(it)
+            },
+            {
+                kaliumLogger.i(
+                    "[tmp-send-trace] step=send_text_use_case_end conversationId=${conversationId.toLogString()} messageId=$generatedMessageUuid state=success elapsedMs=${sendTimer.elapsedNow().inWholeMilliseconds}"
+                )
+                MessageOperationResult.Success
+            }
         )
     }.await()
 

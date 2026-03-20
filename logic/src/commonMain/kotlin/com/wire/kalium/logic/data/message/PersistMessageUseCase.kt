@@ -23,6 +23,7 @@ import com.wire.kalium.common.functional.Either
 import com.wire.kalium.common.functional.fold
 import com.wire.kalium.common.functional.map
 import com.wire.kalium.common.functional.onSuccess
+import com.wire.kalium.common.logger.kaliumLogger
 import com.wire.kalium.logic.data.conversation.Conversation
 import com.wire.kalium.logic.data.notification.NotificationEventsManager
 import com.wire.kalium.logic.data.user.UserId
@@ -31,6 +32,7 @@ import com.wire.kalium.messaging.hooks.PersistenceEventHookNotifier
 import com.wire.kalium.messaging.hooks.PersistedMessageData
 import com.wire.kalium.persistence.dao.message.InsertMessageResult
 import io.mockative.Mockable
+import kotlin.time.TimeSource
 
 /**
  * Internal UseCase that should be used instead of MessageRepository.persistMessage(Message)
@@ -48,12 +50,24 @@ internal class PersistMessageUseCaseImpl(
     private val persistMessageHookNotifier: PersistenceEventHookNotifier = NoOpPersistenceEventHookNotifier
 ) : PersistMessageUseCase {
     override suspend operator fun invoke(message: Message.Standalone): Either<CoreFailure, Unit> {
+        val persistTimer = TimeSource.Monotonic.markNow()
+        kaliumLogger.i(
+            "[tmp-send-trace] step=persist_use_case_start conversationId=${message.conversationId.toLogString()} messageId=${message.id} senderUserId=${message.senderUserId.toLogString()}"
+        )
         val modifiedMessage = getExpectsReadConfirmationFromMessage(message)
         val isSelfSender = message.isSelfTheSender(selfUserId)
 
         return messageRepository.persistMessage(
             message = modifiedMessage,
             updateConversationModifiedDate = message.content.shouldUpdateConversationOrder()
+        ).also { result ->
+            val state = when (result) {
+                is Either.Left -> "failure"
+                is Either.Right -> "success"
+            }
+            kaliumLogger.i(
+                "[tmp-send-trace] step=persist_use_case_repository_end conversationId=${message.conversationId.toLogString()} messageId=${message.id} state=$state elapsedMs=${persistTimer.elapsedNow().inWholeMilliseconds}"
+            )
         ).onSuccess {
             val isConversationMuted = it == InsertMessageResult.INSERTED_INTO_MUTED_CONVERSATION
 
@@ -64,6 +78,9 @@ internal class PersistMessageUseCaseImpl(
             persistMessageHookNotifier.onMessagePersisted(
                 modifiedMessage.toPersistedMessageData(),
                 selfUserId
+            )
+            kaliumLogger.i(
+                "[tmp-send-trace] step=persist_use_case_end conversationId=${message.conversationId.toLogString()} messageId=${message.id} state=success elapsedMs=${persistTimer.elapsedNow().inWholeMilliseconds}"
             )
         }.map { }
     }

@@ -74,6 +74,7 @@ import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.map
 import kotlinx.datetime.Instant
 import kotlin.collections.map
+import kotlin.time.TimeSource
 
 @Suppress("TooManyFunctions")
 @Mockable
@@ -581,14 +582,33 @@ internal class MessageDataSource internal constructor(
 
     override suspend fun sendMLSMessage(
         message: MLSMessageApi.Message
-    ): Either<CoreFailure, MessageSent> =
+    ): Either<CoreFailure, MessageSent> = run {
+        val timer = TimeSource.Monotonic.markNow()
+        kaliumLogger.i(
+            "[tmp-send-trace] step=message_repository_send_mls_start payloadSizeBytes=${message.value.size}"
+        )
         wrapApiRequest {
             mlsMessageApi.sendMessage(message.value)
         }.flatMapLeft { networkFailure ->
+            kaliumLogger.e(
+                "[tmp-send-trace] step=message_repository_send_mls_network_failure failureType=${networkFailure::class.simpleName ?: "UnknownFailure"} elapsedMs=${timer.elapsedNow().inWholeMilliseconds}"
+            )
             Either.Left(networkFailure.wrapNetworkMlsFailureIfApplicable())
         }.flatMap { response ->
+            kaliumLogger.i(
+                "[tmp-send-trace] step=message_repository_send_mls_response_received elapsedMs=${timer.elapsedNow().inWholeMilliseconds}"
+            )
             Either.Right(sendMessagePartialFailureMapper.fromMlsDTO(response))
+        }.also { result ->
+            val state = when (result) {
+                is Either.Left -> "failure"
+                is Either.Right -> "success"
+            }
+            kaliumLogger.i(
+                "[tmp-send-trace] step=message_repository_send_mls_end state=$state elapsedMs=${timer.elapsedNow().inWholeMilliseconds}"
+            )
         }
+    }
 
     override suspend fun getAllPendingMessagesFromUser(senderUserId: UserId): Either<CoreFailure, List<Message>> =
         wrapStorageRequest {

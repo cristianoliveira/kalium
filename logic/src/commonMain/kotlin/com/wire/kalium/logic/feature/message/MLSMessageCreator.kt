@@ -41,6 +41,7 @@ import com.wire.kalium.logic.di.MapperProvider
 import com.wire.kalium.network.api.base.authenticated.message.MLSMessageApi
 import io.mockative.Mockable
 import kotlinx.coroutines.flow.first
+import kotlin.time.TimeSource
 
 @Mockable
 internal interface MLSMessageCreator {
@@ -69,16 +70,34 @@ internal class MLSMessageCreatorImpl(
         groupId: GroupID,
         message: Message.Sendable
     ): Either<CoreFailure, MLSMessageApi.Message> = transactionContext.wrapInMLSContext { mlsContext ->
+        val timer = TimeSource.Monotonic.markNow()
+        kaliumLogger.i(
+            "[tmp-send-trace] step=mls_prepare_start conversationId=${message.conversationId.toLogString()} messageId=${message.id} groupId=${groupId.toLogString()}"
+        )
         val doesConversationExist = mlsContext.conversationExists(idMapper.toCryptoModel(groupId))
+        kaliumLogger.i(
+            "[tmp-send-trace] step=mls_prepare_conversation_exists conversationId=${message.conversationId.toLogString()} messageId=${message.id} groupId=${groupId.toLogString()} exists=$doesConversationExist"
+        )
         if (doesConversationExist) {
             mlsConversationRepository.commitPendingProposals(mlsContext, groupId)
         } else {
             joinExistingConversationUseCase(transactionContext, message.conversationId)
         }.flatMap {
+            kaliumLogger.i(
+                "[tmp-send-trace] step=mls_prepare_group_ready conversationId=${message.conversationId.toLogString()} messageId=${message.id} groupId=${groupId.toLogString()} elapsedMs=${timer.elapsedNow().inWholeMilliseconds}"
+            )
             createOutgoingMLSMessage(
                 mlsContext = mlsContext,
                 groupId = groupId,
                 message = message
+            )
+        }.also { result ->
+            val state = when (result) {
+                is Either.Left -> "failure"
+                is Either.Right -> "success"
+            }
+            kaliumLogger.i(
+                "[tmp-send-trace] step=mls_prepare_end conversationId=${message.conversationId.toLogString()} messageId=${message.id} groupId=${groupId.toLogString()} state=$state elapsedMs=${timer.elapsedNow().inWholeMilliseconds}"
             )
         }
     }
@@ -88,6 +107,7 @@ internal class MLSMessageCreatorImpl(
         groupId: GroupID,
         message: Message.Sendable
     ): Either<CoreFailure, MLSMessageApi.Message> {
+        val timer = TimeSource.Monotonic.markNow()
         kaliumLogger.i("Creating outgoing MLS message (groupID = ${groupId.toLogString()})")
         val expectsReadConfirmation = when (message) {
             is Message.Regular -> message.expectsReadConfirmation
@@ -109,8 +129,19 @@ internal class MLSMessageCreatorImpl(
                 legalHoldStatus = legalHoldStatus
             )
         )
+        kaliumLogger.i(
+            "[tmp-send-trace] step=mls_encrypt_start conversationId=${message.conversationId.toLogString()} messageId=${message.id} groupId=${groupId.toLogString()}"
+        )
         return wrapMLSRequest {
             MLSMessageApi.Message(mlsContext.encryptMessage(idMapper.toCryptoModel(groupId), content.data))
+        }.also { result ->
+            val state = when (result) {
+                is Either.Left -> "failure"
+                is Either.Right -> "success"
+            }
+            kaliumLogger.i(
+                "[tmp-send-trace] step=mls_encrypt_end conversationId=${message.conversationId.toLogString()} messageId=${message.id} groupId=${groupId.toLogString()} state=$state elapsedMs=${timer.elapsedNow().inWholeMilliseconds}"
+            )
         }
     }
 }
