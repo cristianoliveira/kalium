@@ -68,7 +68,7 @@ internal class PersistMessageUseCaseImpl(
             kaliumLogger.i(
                 "[tmp-send-trace] step=persist_use_case_repository_end conversationId=${message.conversationId.toLogString()} messageId=${message.id} state=$state elapsedMs=${persistTimer.elapsedNow().inWholeMilliseconds}"
             )
-        ).onSuccess {
+        }.onSuccess {
             val isConversationMuted = it == InsertMessageResult.INSERTED_INTO_MUTED_CONVERSATION
 
             if (!isConversationMuted && !isSelfSender && message.content.shouldNotifyUser()) {
